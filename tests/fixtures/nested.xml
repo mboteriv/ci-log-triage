@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites><testsuite name="integration"><testsuite name="database">
+<testcase classname="tests.test_db" name="test_connect"><failure type="ConnectionError" message="connection refused">File "client.py", line 12, in connect
+ConnectionError: connection refused</failure></testcase>
+<testcase classname="tests.test_db" name="test_retry"><failure type="ConnectionError" message="connection refused">File "client.py", line 98, in connect
+ConnectionError: connection refused</failure></testcase>
+<testcase name="test_ok"/>
+<testcase name="test_optional"><skipped message="service disabled"/></testcase>
+<testcase name="test_setup"><error type="RuntimeError" message="missing fixture">fixture unavailable</error></testcase>
+</testsuite></testsuite></testsuites>
