@@ -12,6 +12,45 @@ MAX_BYTES = 8 * 1024 * 1024
 MAX_REPORTS = 32
 MAX_DEPTH = 64
 MAX_ELEMENTS = 100_000
+MAX_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_DIAGNOSTIC_BYTES = 256 * 1024
+MAX_RETAINED_BYTES = 4 * 1024 * 1024
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+
+
+class Budget:
+    def __init__(self, limit: int, label: str):
+        self.remaining = limit
+        self.label = label
+
+    def charge(self, size: int) -> None:
+        if size > self.remaining:
+            raise InvalidInput(f"{self.label} limit exceeded; split or reduce the reports")
+        self.remaining -= size
+
+
+def bounded_join(chunks, separator="") -> str:
+    budget = Budget(MAX_OUTPUT_BYTES, "encoded UTF-8 output")
+    result = []
+    for chunk in chunks:
+        if result:
+            budget.charge(len(separator.encode('utf-8')))
+        budget.charge(len(chunk.encode('utf-8')))
+        result.append(chunk)
+    return separator.join(result)
+
+
+class OutputLines(list):
+    def __init__(self, lines):
+        super().__init__()
+        self.budget = Budget(MAX_OUTPUT_BYTES, "encoded UTF-8 output")
+        self += lines
+
+    def __iadd__(self, lines):
+        for line in lines:
+            self.budget.charge(len(line.encode('utf-8')) + bool(self))
+            self.append(line)
+        return self
 
 
 class InvalidInput(ValueError):
@@ -22,10 +61,13 @@ def local(name: str) -> str:
     return name.rsplit("}", 1)[-1]
 
 
-def parse_report(path: Path, source: str) -> tuple[list[dict], dict]:
+def parse_report(path: Path, source: str, retained=None, aggregate=None) -> tuple[list[dict], dict]:
+    retained = retained or Budget(MAX_RETAINED_BYTES, "retained material")
+    aggregate = aggregate or Budget(MAX_TOTAL_BYTES, "aggregate input bytes")
     # Reading one extra byte detects oversize files without allocating their size.
     with path.open("rb") as stream:
-        data = stream.read(MAX_BYTES + 1)
+        data = stream.read(min(MAX_BYTES, aggregate.remaining) + 1)
+    aggregate.charge(len(data))
     if len(data) > MAX_BYTES:
         raise InvalidInput(f"{source}: exceeds {MAX_BYTES} bytes")
     parser = expat.ParserCreate(namespace_separator="}")
@@ -66,14 +108,18 @@ def parse_report(path: Path, source: str) -> tuple[list[dict], dict]:
             if name == "skipped":
                 current["skipped"] = True
             else:
+                size = sum(len(attrs.get(k, '').encode('utf-8')) for k in ('type', 'message'))
+                if size > MAX_DIAGNOSTIC_BYTES:
+                    raise InvalidInput(f"{source}: diagnostic exceeds {MAX_DIAGNOSTIC_BYTES} UTF-8 bytes")
                 diagnostic = dict(kind=name, type=attrs.get("type", ""),
-                                  message=attrs.get("message", ""), chunks=[])
+                                  message=attrs.get("message", ""), chunks=[], size=size)
         stack.append(name)
 
     def end(raw: str) -> None:
         nonlocal current, diagnostic
         name = local(raw)
         if name in ("failure", "error") and diagnostic is not None:
+            diagnostic.pop('size')
             diagnostic["text"] = "".join(diagnostic.pop("chunks"))
             assert current is not None
             current["events"].append(diagnostic)
@@ -85,6 +131,10 @@ def parse_report(path: Path, source: str) -> tuple[list[dict], dict]:
             if events:
                 stats["failed_tests"] += 1
                 for index, event in enumerate(events, 1):
+                    # Account repeated references before retaining each event.
+                    size = sum(len(str(v).encode('utf-8')) for v in current.values())
+                    size += sum(len(v.encode('utf-8')) for v in event.values())
+                    retained.charge(size + 1024)
                     stats[event["kind"] + "_elements"] += 1
                     failures.append(dict(test=dict(current), event_index=index, **event))
             else:
@@ -96,6 +146,9 @@ def parse_report(path: Path, source: str) -> tuple[list[dict], dict]:
 
     def chars(value: str) -> None:
         if diagnostic is not None:
+            diagnostic['size'] += len(value.encode('utf-8'))
+            if diagnostic['size'] > MAX_DIAGNOSTIC_BYTES:
+                raise InvalidInput(f"{source}: diagnostic exceeds {MAX_DIAGNOSTIC_BYTES} UTF-8 bytes")
             diagnostic["chunks"].append(value)
 
     parser.StartElementHandler = start
@@ -134,10 +187,12 @@ def analyze(paths: list[Path]) -> dict:
     # Full paths retain duplicate basenames and repeated test IDs across reports.
     unique = sorted({p.resolve() for p in paths}, key=lambda p: p.as_posix())
     groups: dict[str, dict] = {}
+    aggregate = Budget(MAX_TOTAL_BYTES, 'aggregate input bytes')
+    retained = Budget(MAX_RETAINED_BYTES, 'retained material')
     summary = dict(reports=len(unique), tests=0, passed=0, skipped=0, failed_tests=0,
                    failure_elements=0, error_elements=0)
     for path in unique:
-        events, stats = parse_report(path, path.as_posix())
+        events, stats = parse_report(path, path.as_posix(), retained, aggregate)
         for key, count in stats.items():
             summary[key] += count
         for event in events:
@@ -154,7 +209,11 @@ def analyze(paths: list[Path]) -> dict:
 
 
 def render_json(report: dict) -> str:
-    return json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    encoder = json.JSONEncoder(ensure_ascii=True, indent=2, sort_keys=True)
+    def chunks():
+        yield from encoder.iterencode(report)
+        yield '\n'
+    return bounded_join(chunks())
 
 
 def escape(value: str) -> str:
@@ -166,9 +225,9 @@ def escape(value: str) -> str:
 
 def render_markdown(report: dict) -> str:
     s = report["summary"]
-    lines = ["# CI Log Triage", "", f"Reports: {s['reports']} | Tests: {s['tests']} | "
+    lines = OutputLines(["# CI Log Triage", "", f"Reports: {s['reports']} | Tests: {s['tests']} | "
              f"Failed tests: {s['failed_tests']} | Failure/error events: {s['events']} | "
-             f"Groups: {s['groups']}", "", f"Passed: {s['passed']} | Skipped: {s['skipped']}", ""]
+             f"Groups: {s['groups']}", "", f"Passed: {s['passed']} | Skipped: {s['skipped']}", ""])
     if not report["groups"]:
         lines += ["No failure or error elements found.", ""]
     for group in report["groups"]:

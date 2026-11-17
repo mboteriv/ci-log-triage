@@ -94,9 +94,20 @@ Failures take precedence over a skipped marker on the same testcase.
 XML is parsed with standard-library Expat, with all DTDs and entity declarations
 rejected before expansion, including UTF-16 input. No external entity fetches.
 Predefined XML escapes and namespaces are supported. Keep Python/Expat patched.
-Limits: 8 MiB per file, 32 reports, 64 XML element levels, 100,000 elements per
-report. Whole bounded files and diagnostics are held in memory; JSON output
-duplicates representatives, so these are input bounds, not a peak-RAM guarantee.
+Fixed resource limits (not configurable): 8 MiB per file; 16 MiB aggregate raw
+input bytes after path deduplication; 32 reports; 64 XML element levels;
+100,000 elements per report. Each diagnostic (type + message + text) is limited
+to 256 KiB of decoded UTF-8. Retained events have a shared 4 MiB accounting
+budget including test references and a conservative 1024-byte charge per event.
+JSON and Markdown are limited to 16 MiB of encoded UTF-8 output, counted
+incrementally before final joining. These limits accommodate small CI reports
+while bounding multiplication of diagnostic evidence. Oversize reports fail
+with exit 2 and an explicit limit error: split or reduce inputs; no truncation,
+partial stdout or replacement of an existing output on resource rejection.
+Whole bounded XML files, parser tokens, Python objects and serialization chunks
+still use memory; accounting is not a strict process-RAM ceiling or protection
+against every denial-of-service input. Previously accepted oversized reports
+may now be rejected; supported fingerprints and JSON structure are unchanged.
 
 Root must be testsuite/testsuites. Nested suites and direct testcase children
 are supported. Failure/error/skipped markers must be direct testcase children;
